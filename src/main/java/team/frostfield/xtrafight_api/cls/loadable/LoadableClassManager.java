@@ -1,0 +1,273 @@
+package team.frostfield.xtrafight_api.cls.loadable;
+
+import net.neoforged.fml.ModContainer;
+import net.neoforged.fml.ModList;
+import net.neoforged.fml.ModLoadingContext;
+import net.neoforged.neoforgespi.language.IModFileInfo;
+import net.neoforged.neoforgespi.language.ModFileScanData;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.objectweb.asm.Type;
+import sun.misc.Unsafe;
+import team.frostfield.xtrafight_api.cls.loadable.enums.LoadableEnum;
+import team.frostfield.xtrafight_api.cls.loadable.marks.Compatibility;
+import team.frostfield.xtrafight_api.cls.loadable.marks.Invoke;
+import team.frostfield.xtrafight_api.cls.maps.BasicHashMap;
+import team.frostfield.xtrafight_api.cls.maps.BasicMap;
+import team.frostfield.xtrafight_api.events.bus.ModBus;
+import team.frostfield.xtrafight_api.events.bus.NeoBus;
+import team.frostfield.xtrafight_api.exception.ClassLoadingException;
+import team.frostfield.xtrafight_api.exception.DeveloperException;
+import team.frostfield.xtrafight_api.main.XtraFightAPI;
+import team.frostfield.xtrafight_api.main.XtraFightAPIMod;
+import team.frostfield.xtrafight_api.utils.EnvironmentHelper;
+import team.frostfield.xtrafight_api.utils.EnvironmentHelper.Environments;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Modifier;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+public final class LoadableClassManager {
+    private static final Logger LOGGER = LogManager.getLogger("LoadableClassManager");
+    private static final BasicMap<String, Class<? extends ILoadableClass>> LOADED_CLASSES = new BasicHashMap<>();
+    private static final BasicMap<String, Class<? extends ILoadableClass>> ERRORED_CLASSES = new BasicHashMap<>();
+
+    @SafeVarargs
+    public static void loadClass(ModBus bus, Class<? extends ILoadableClass>... loadableClasses) {
+        for (Class<? extends ILoadableClass> loadableClass : loadableClasses) {
+            String className = loadableClass.getName();
+            String simpleClassName = loadableClass.getSimpleName();
+
+            if (!LoadableClassManager.acceptsImplementation(loadableClass)) {
+                LOGGER.error("Cannot load [{}]: doesn't accept implementations!", className);
+                continue;
+            }
+
+            if (loadableClass.isEnum()) {
+                LOGGER.warn("Class [{}] is an enum class!, use LoadableClassManager#loadEnum instead!", simpleClassName);
+                continue;
+            }
+
+            if (LOADED_CLASSES.containsKey(className)) {
+                throw new ClassLoadingException("Class [" + className + "] is already loaded!");
+            }
+
+            Map<Class<?>, Object> allowedConstructorArgs = Map.of(
+                    Environments.class, EnvironmentHelper.getEnvironment(),
+                    ModBus.class, bus,
+                    NeoBus.class, NeoBus.EVENT_BUS
+            );
+
+            try {
+                Compatibility compatibilityAnn = loadableClass.getAnnotation(Compatibility.class);
+                StringBuilder modDisplayNames = new StringBuilder();
+
+                if (compatibilityAnn != null) {
+                    if (compatibilityAnn.clientSide() && !EnvironmentHelper.getEnvironment().is(Environments.CLIENT)) {
+                        if (compatibilityAnn.debug()) {
+                            LOGGER.debug("Skipping Client-Only Compatibility Class [{}]: On Dedicated Server.", simpleClassName);
+                        }
+                        LOADED_CLASSES.put(className, loadableClass);
+                        continue;
+                    }
+
+                    String[] requiredMods = compatibilityAnn.modid();
+                    boolean allModsLoaded = true;
+
+                    for (String modid : requiredMods) {
+                        if (!ModList.get().isLoaded(modid)) {
+                            allModsLoaded = false;
+                            if (compatibilityAnn.debug()) {
+                                LOGGER.info("Compatibility class [{}] skipped: Missing mod '{}'.", simpleClassName, modid);
+                            }
+                            break;
+                        }
+
+                        modDisplayNames.append(modDisplayNames.isEmpty() ? "" : ", ")
+                                .append(ModList.get().getModContainerById(modid)
+                                        .map(c -> c.getModInfo().getDisplayName())
+                                        .orElse(modid));
+                    }
+
+                    if (!allModsLoaded) {
+                        LOADED_CLASSES.put(className, loadableClass);
+                        continue;
+                    }
+                }
+
+                Constructor<?> selectedConstructor = null;
+                Object[] resolvedArgs = null;
+                int validConstructorCount = 0;
+
+                for (Constructor<?> constructor : loadableClass.getDeclaredConstructors()) {
+                    Class<?>[] parameterTypes = constructor.getParameterTypes();
+                    Object[] args = new Object[parameterTypes.length];
+                    boolean canResolve = true;
+
+                    for (int i = 0; i < parameterTypes.length; i++) {
+                        if (allowedConstructorArgs.containsKey(parameterTypes[i])) {
+                            args[i] = allowedConstructorArgs.get(parameterTypes[i]);
+                        } else {
+                            canResolve = false;
+                            break;
+                        }
+                    }
+
+                    if (canResolve) {
+                        validConstructorCount++;
+                        if (constructor.isAnnotationPresent(Invoke.class) || selectedConstructor == null) {
+                            selectedConstructor = constructor;
+                            resolvedArgs = args;
+                        }
+                    }
+                }
+
+                if (selectedConstructor == null || validConstructorCount > 1) {
+                    String availableTypes = allowedConstructorArgs.keySet().stream()
+                            .map(Class::getSimpleName)
+                            .collect(Collectors.joining(", "));
+                    ERRORED_CLASSES.put(className, loadableClass);
+                    IllegalArgumentException ex = new IllegalArgumentException(
+                            "Failed to load Class [%s]: Must have exactly one valid constructor. Constructors can accept any combination of these injectable types: [%s]"
+                                    .formatted(simpleClassName, availableTypes)
+                    );
+                    DeveloperException.throwExBoth(ex);
+                    continue;
+                }
+
+                selectedConstructor.setAccessible(true);
+                ILoadableClass instance = (ILoadableClass) selectedConstructor.newInstance(resolvedArgs);
+
+                instance.onModConstruct(bus);
+                instance.onGameConstruct(NeoBus.EVENT_BUS);
+
+                if (EnvironmentHelper.getEnvironment().is(Environments.CLIENT)) {
+                    instance.onModClientConstruct(bus);
+                    instance.onGameClientConstruct(NeoBus.EVENT_BUS);
+                }
+
+                if (selectedConstructor.isAnnotationPresent(Invoke.class)) {
+                    LOGGER.info("Constructed class [{}]", simpleClassName);
+                } else if (compatibilityAnn != null) {
+                    LOGGER.info("Loaded compatibility class [{}] for ({})", simpleClassName, modDisplayNames);
+                } else {
+                    LOGGER.info("Loaded class: [{}]", simpleClassName);
+                }
+
+                ERRORED_CLASSES.removeKeyIfPresent(className);
+                LOADED_CLASSES.put(className, loadableClass);
+            } catch (DeveloperException devE) {
+                DeveloperException.throwExBoth(devE);
+            } catch (Exception e) {
+                XtraFightAPIMod.err("Failed to load class [{}], {}", className, e);
+                ERRORED_CLASSES.put(className, loadableClass);
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public static void runUnloadedCheck() {
+        ModContainer container = ModLoadingContext.get().getActiveContainer();
+        if (container != null) {
+            checkUnloaded(container.getModId());
+        }
+    }
+
+    public static Class<? extends ILoadableClass> getLoadedClassByName(String clsName) {
+        return LOADED_CLASSES.get(clsName);
+    }
+
+    public static boolean hadErrorsLoading(Class<? extends ILoadableClass> loadableCls) {
+        return ERRORED_CLASSES.containsValue(loadableCls);
+    }
+
+    private static void checkUnloaded(String modId) {
+        IModFileInfo modFile = ModList.get().getModFileById(modId);
+        if (modFile == null)
+            return;
+
+        ModFileScanData scanData = modFile.getFile().getScanResult();
+        Type loadableClsType = Type.getType(ILoadableClass.class);
+
+        Set<String> loadedNames = LOADED_CLASSES.keySet();
+        Set<String> errorClassNames = ERRORED_CLASSES.keySet();
+
+        scanData.getClasses().stream()
+                .filter(classData -> classData.interfaces().contains(loadableClsType))
+                .map(classData -> classData.clazz().getClassName())
+                .filter(className -> !loadedNames.contains(className) && !errorClassNames.contains(className))
+                .filter(className -> {
+                    try {
+                        Class<?> clazz = Class.forName(className, false, Thread.currentThread().getContextClassLoader());
+
+                        Compatibility compatibilityAnn = clazz.getAnnotation(Compatibility.class);
+                        if (compatibilityAnn != null) {
+                            if (compatibilityAnn.clientSide() && !EnvironmentHelper.getEnvironment().is(Environments.CLIENT)) {
+                                return false;
+                            }
+                            for (String modid : compatibilityAnn.modid()) {
+                                if (!ModList.get().isLoaded(modid)) {
+                                    return false;
+                                }
+                            }
+                        }
+
+                        if (ILoadableClass.class.isAssignableFrom(clazz)) {
+                            try {
+                                Constructor<?> constructor = clazz.getDeclaredConstructor();
+                                constructor.setAccessible(true);
+                                ILoadableClass instance = (ILoadableClass) constructor.newInstance();
+                                return !instance.ignoreNotLoadedWarning();
+                            } catch (NoSuchMethodException e) {
+                                try {
+                                    var unsafeField = Unsafe.class.getDeclaredField("theUnsafe");
+                                    unsafeField.setAccessible(true);
+                                    Unsafe unsafe = (Unsafe) unsafeField.get(null);
+                                    ILoadableClass instance = (ILoadableClass) unsafe.allocateInstance(clazz);
+                                    return !instance.ignoreNotLoadedWarning();
+                                } catch (Throwable ignored) {}
+                            }
+                        }
+                    } catch (Throwable t) {
+                        return false;
+                    }
+                    return true;
+                })
+                .forEach(className -> {
+                    if (!loadedNames.contains(className) && !errorClassNames.contains(className)) {
+                        if (EnvironmentHelper.getEnvironment().isDevEnv()) {
+                            throw new ClassLoadingException("Class [" + className + "] is never loaded!");
+                        } else {
+                            XtraFightAPI.LOGGER.error("Class [{}] was never loaded!", className);
+                        }
+                    }
+                });
+    }
+
+    public static boolean acceptsImplementation(Class<?> clazz) {
+        return !clazz.isInterface() && !Modifier.isAbstract(clazz.getModifiers());
+    }
+
+    public static void loadEnum(ModBus modBus, LoadableEnum[] loadableEnumValues) {
+        Class<? extends ILoadableClass>[] commonClasses = Arrays.stream(loadableEnumValues)
+                .filter(loadableEnum -> !loadableEnum.isClientOnly())
+                .map(LoadableEnum::getLoadableClass)
+                .<Class<? extends ILoadableClass>>toArray(Class[]::new);
+
+        loadClass(modBus, commonClasses);
+
+        if (EnvironmentHelper.getEnvironment().isClient()) {
+            Class<? extends ILoadableClass>[] clientClasses = Arrays.stream(loadableEnumValues)
+                    .filter(LoadableEnum::isClientOnly)
+                    .map(LoadableEnum::getLoadableClass)
+                    .<Class<? extends ILoadableClass>>toArray(Class[]::new);
+
+            loadClass(modBus, clientClasses);
+        }
+
+        runUnloadedCheck();
+    }
+}
